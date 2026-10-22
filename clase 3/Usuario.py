@@ -20,6 +20,9 @@ class Usuario:
     fecha_suspension: FechaNula = None
 
     def activar(self):
+        if self.estado == Estado.ACTIVO:
+            raise ValueError('El usuario ya está activo')
+
         self.estado = Estado.ACTIVO
 
     def suspender(self):
