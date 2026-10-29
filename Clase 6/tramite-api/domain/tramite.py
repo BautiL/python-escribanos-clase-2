@@ -13,5 +13,5 @@ class Tramite:
     id: int 
     tipo: str
     cliente: str 
-    monto: float 
+    monto: float
     estado: EstadoTramite = EstadoTramite.INICIADO

@@ -1,35 +1,45 @@
 from typing import Protocol 
-
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from domain.tramite import Tramite
+from repository.mappers.tramiteMapper import TramiteMapper
+from repository.models.tramiteModel import TramiteModel
 
 class RepositorioTramite(Protocol): 
     # El "contrato" (la interface de "Java")
-    def siguiente_id(self) -> int: ...
-    def guardar(self, tramite: Tramite) -> None: ...
-    def buscar(self, tramite_id: int) -> Tramite | None: ...
-    def listar(self) -> list[Tramite]: ...
-    def eliminar(self, tramite_id: int) -> None: ...
+    async def guardar(self, tramite: Tramite) -> None: ...
+    async def buscar(self, tramite_id: int) -> Tramite | None: ...
+    async def listar(self) -> list[Tramite]: ...
+    async def eliminar(self, tramite_id: int) -> None: ...
 
-class RepositorioEnMemoria: 
-    def __init__(self) -> None:
-        self._datos: dict[int, Tramite] = {} # id -> tramite
-        self._ultimo_id = 0 # "autoincrementar" casero
+class RepositorioTramiteSqlalchemy: 
+    def __init__(self, session: AsyncSession):
+        self.session = session
 
-    def siguiente_id(self) -> int:
-        self._ultimo_id += 1
-        return self._ultimo_id
+    async def guardar(self, tramite: Tramite) -> None: 
+        tramite_model = TramiteMapper.to_model(tramite)
+        await self.session.merge(tramite_model)
+        await self.session.flush()
+        tramite.id = tramite_model.id
 
-    def guardar(self, tramite: Tramite) -> None: 
-        self._datos[tramite.id] = tramite # si ya existia, lo pisa (sirve para el update)
+    async def eliminar(self, tramite_id: int) -> None:
+        tramite = await self.session.get(TramiteModel, tramite_id)
+        if tramite:
+            await self.session.delete(tramite)
+        else:
+            raise ValueError('El tramite a eliminar no existe')
 
-    def eliminar(self, tramite_id: int) -> None:
-        self._datos.pop(tramite_id, None) # el None evita error si ya no estaba / existia
+    async def buscar(self, tramite_id: int) -> Tramite | None:
+        query = select(TramiteModel).where(TramiteModel.id == tramite_id)
+        result = await self.session.execute(query)
+        tramite_model = result.scalar()
 
-    # TAREA!!!!!!!
-    def buscar(self, tramite_id: int) -> Tramite | None:
-        pass
+        if tramite_model:
+            return TramiteMapper.to_domain(tramite_model)
+        raise ValueError('El tramite buscado no existe')
 
-    def listar(self) -> list[Tramite]:
-        pass
-
+    async def listar(self) -> list[Tramite]:
+        query = select(TramiteModel)
+        result = await self.session.execute(query)
+        return [TramiteMapper.to_domain(tramite_model) for tramite_model in result.scalars().all()]
     
