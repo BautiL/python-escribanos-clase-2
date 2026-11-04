@@ -14,7 +14,7 @@ class TramiteService:
     async def crear(self, datos: TramiteCrear) -> Tramite: 
         async with self._uow:
             tramite = Tramite(**datos.model_dump())
-            await self._uow.tramites.guardar(tramite)
+            tramite = await self._uow.tramites.guardar(tramite)
             await self._uow.commit()
             return tramite
 

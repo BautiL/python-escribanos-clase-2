@@ -1,10 +1,10 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, status
 
 from dependencies import ServiceDep
 
-from schemas.tramite import TramiteRespuesta
+from schemas.tramite import TramiteRespuesta, TramiteCrear
 
 from domain.tramite import EstadoTramite
 
@@ -15,3 +15,8 @@ async def listar(service:ServiceDep, estado:EstadoTramite | None=None,
                  skip: Annotated[int, Query(ge=0)] = 0, 
                  limit: Annotated[int, Query(ge=1, le=100)]=10) -> list[TramiteRespuesta]:
     return [TramiteRespuesta.model_validate(t) for t in await service.listar(estado, skip, limit)]
+
+@router.post("/", status_code = status.HTTP_201_CREATED)
+async def crear(datos: TramiteCrear, service: ServiceDep) -> TramiteRespuesta:
+    tramite = await service.crear(datos)
+    return TramiteRespuesta.model_validate(tramite)

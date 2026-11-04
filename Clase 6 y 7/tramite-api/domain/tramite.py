@@ -10,8 +10,8 @@ class EstadoTramite(StrEnum):
 
 @dataclass
 class Tramite: 
-    id: int 
     tipo: str
     cliente: str 
     monto: float
     estado: EstadoTramite = EstadoTramite.INICIADO
+    id: int | None = None
