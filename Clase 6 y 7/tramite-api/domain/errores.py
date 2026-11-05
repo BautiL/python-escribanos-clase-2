@@ -7,6 +7,12 @@ class TramiteNoEncontrado(TramiteError):
         self.tramite_id = tramite_id
 
 class TramiteFinalizado(TramiteError):
-    def __init__(self, tramite_id: int) -> None: 
+    def __init__(self, tramite_id: int) -> None:
         super().__init__(f"El tramite {tramite_id} esta finalizado y no se puede modificar")
         self.tramite_id = tramite_id
+
+
+class DocumentoNoEncontrado(TramiteError):
+    def __init__(self, documento_id: int) -> None:
+        super().__init__(f"No existe el documento {documento_id}")
+        self.documento_id = documento_id

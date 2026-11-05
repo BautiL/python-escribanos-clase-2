@@ -1,5 +1,6 @@
 from domain.tramite import Tramite
 from repository.models.tramiteModel import TramiteModel
+from repository.mappers.documentoMapper import DocumentoMapper
 
 class TramiteMapper:
     @staticmethod
@@ -9,7 +10,8 @@ class TramiteMapper:
             tipo= tramite.tipo,
             cliente= tramite.cliente,
             monto = tramite.monto,
-            estado=tramite.estado
+            estado=tramite.estado,
+            documentos = [DocumentoMapper.to_model(documento) for documento in tramite.documentos]
         )
 
     @staticmethod
@@ -19,5 +21,8 @@ class TramiteMapper:
             tipo= tramite_model.tipo,
             cliente= tramite_model.cliente,
             monto = tramite_model.monto,
-            estado=tramite_model.estado
+            estado=tramite_model.estado,
+            documentos = [
+                DocumentoMapper.to_domain(documento_model) for documento_model in tramite_model.documentos
+            ]
         )

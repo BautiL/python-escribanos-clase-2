@@ -22,7 +22,8 @@ if config.config_file_name is not None:
 # target_metadata = mymodel.Base.metadata
 from repository.database import DATABASE_URL, Base
 
-import repository.models.tramiteModel 
+import repository.models.documentoModel
+import repository.models.tramiteModel
 
 config.set_main_option("sqlalchemy.url", DATABASE_URL)
 target_metadata = Base.metadata

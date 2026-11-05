@@ -1,10 +1,12 @@
 from typing import Protocol, Self
 from types import TracebackType
 from repository.tramite_repository import RepositorioTramite, RepositorioTramiteSqlalchemy
+from repository.documento_repository import RepositorioDocumento, RepositorioDocumentoSqlalchemy
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 class AbstractUnitOfWork(Protocol):
     tramites: RepositorioTramite
+    documentos: RepositorioDocumento
 
     async def __aenter__(self) -> Self: ...
     async def __aexit__(self, exc_type:type[BaseException], exc_val:BaseException | None, 
@@ -14,6 +16,7 @@ class AbstractUnitOfWork(Protocol):
 
 class SqlAlchemyUnitOfWork:
     tramites: RepositorioTramite
+    documentos: RepositorioDocumento
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self.session_factory = session_factory
@@ -22,6 +25,7 @@ class SqlAlchemyUnitOfWork:
         self.session = self.session_factory()
 
         self.tramites= RepositorioTramiteSqlalchemy(self.session)
+        self.documentos = RepositorioDocumentoSqlalchemy(self.session)
         return self
 
     async def __aexit__(self, exc_type:type[BaseException], exc_val:BaseException | None, 

@@ -22,7 +22,7 @@ class TramiteRespuesta(BaseModel):
     # "podes armarme a partir de cualquier objeto que tengas estos atributos (por ejemplo, del dataclass Tramite del dominio)"
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: int | None = None
     tipo: str
     cliente: str
     monto: float
