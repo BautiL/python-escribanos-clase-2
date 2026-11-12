@@ -18,7 +18,7 @@ class RepositorioTramiteSqlalchemy:
 
     async def guardar(self, tramite: Tramite) -> Tramite: 
         tramite_model = TramiteMapper.to_model(tramite)
-        await self.session.merge(tramite_model)
+        self.session.add(tramite_model)
         await self.session.flush()
         tramite.id = tramite_model.id
         return tramite

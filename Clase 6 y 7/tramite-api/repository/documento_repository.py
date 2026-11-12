@@ -18,7 +18,7 @@ class RepositorioDocumentoSqlalchemy:
 
     async def guardar(self, documento: Documento) -> Documento:
         documento_model = DocumentoMapper.to_model(documento)
-        await self.session.merge(documento_model)
+        self.session.add(documento_model)
         await self.session.flush()
         documento.id = documento_model.id
         documento.tramite_id = documento_model.tramite_id
