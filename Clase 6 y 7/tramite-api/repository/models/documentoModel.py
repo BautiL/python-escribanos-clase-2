@@ -8,6 +8,7 @@ from repository.database import Base
 if TYPE_CHECKING:
     from repository.models.tramiteModel import TramiteModel
 
+
 class DocumentoModel(Base):
     __tablename__ = "documentos"
 
@@ -15,8 +16,8 @@ class DocumentoModel(Base):
     nombre: Mapped[str]
     tipo: Mapped[str]
     tamanio: Mapped[int | None] = mapped_column(nullable=True)
-    tramite_id: Mapped[int] = mapped_column(ForeignKey("tramites.id"), nullable=False)
+    tramite_id: Mapped[int] = mapped_column(
+        ForeignKey("tramites.id", ondelete="CASCADE"), nullable=False
+    )
 
-    tramite: Mapped["TramiteModel"] = relationship(
-    back_populates="documentos", lazy="selectin"
-    )       
+    tramite: Mapped["TramiteModel"] = relationship(back_populates="documentos")

@@ -24,6 +24,7 @@ from repository.database import DATABASE_URL, Base
 
 import repository.models.documentoModel
 import repository.models.tramiteModel
+import repository.models.usuarioModel
 
 config.set_main_option("sqlalchemy.url", DATABASE_URL)
 target_metadata = Base.metadata
