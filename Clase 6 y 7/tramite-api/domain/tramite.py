@@ -21,4 +21,5 @@ class Tramite:
     monto: float
     estado: EstadoTramite = EstadoTramite.INICIADO
     id: int | None = None
+    usuario_id: int | None = None # dueño del tramite!
     documentos: list[Documento] = field(default_factory=list)

@@ -11,6 +11,7 @@ class TramiteMapper:
             cliente= tramite.cliente,
             monto = tramite.monto,
             estado=tramite.estado,
+            usuario_id = tramite.usuario_id, 
             documentos = [DocumentoMapper.to_model(documento) for documento in tramite.documentos]
         )
 
@@ -22,6 +23,7 @@ class TramiteMapper:
             cliente= tramite_model.cliente,
             monto = tramite_model.monto,
             estado=tramite_model.estado,
+            usuario_id = tramite_model.usuario_id,
             documentos = [
                 DocumentoMapper.to_domain(documento_model) for documento_model in tramite_model.documentos
             ]

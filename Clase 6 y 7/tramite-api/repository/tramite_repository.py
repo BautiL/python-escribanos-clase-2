@@ -14,7 +14,7 @@ class RepositorioTramite(Protocol):
     async def guardar(self, tramite: Tramite) -> Tramite: ...
     async def buscar(self, tramite_id: int) -> Tramite | None: ...
     async def listar(
-        self, estado: EstadoTramite | None = None, skip: int = 0, limit: int | None = None
+        self, usuario_id: int, estado: EstadoTramite | None = None, skip: int = 0, limit: int | None = None
     ) -> list[Tramite]: ...
     async def eliminar(self, tramite_id: int) -> None: ...
 
@@ -61,10 +61,10 @@ class RepositorioTramiteSqlalchemy:
         return TramiteMapper.to_domain(tramite_model)
 
     async def listar(
-        self, estado: EstadoTramite | None = None, skip: int = 0, limit: int | None = None
+        self, usuario_id: int, estado: EstadoTramite | None = None, skip: int = 0, limit: int | None = None
     ) -> list[Tramite]:
         # El filtro y la paginacion se hacen en la base, no en memoria
-        query = select(TramiteModel).order_by(TramiteModel.id)
+        query = select(TramiteModel).where(TramiteModel.usuario_id == usuario_id).order_by(TramiteModel.id)
         if estado is not None:
             query = query.where(TramiteModel.estado == estado)
         query = query.offset(skip)

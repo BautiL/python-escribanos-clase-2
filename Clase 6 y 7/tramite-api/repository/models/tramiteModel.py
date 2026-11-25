@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Enum as SQLEnum
+from sqlalchemy import ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from domain.tramite import EstadoTramite
@@ -28,6 +29,9 @@ class TramiteModel(Base):
         ),
         default=EstadoTramite.INICIADO,
         nullable=False,
+    )
+    usuario_id: Mapped[int | None] = mapped_column(
+        ForeignKey("usuarios.id"), nullable=True, index=True
     )
     # cascade: al borrar un tramite se borran sus documentos
     # (sin esto SQLAlchemy intenta poner tramite_id = NULL y falla por el NOT NULL).
