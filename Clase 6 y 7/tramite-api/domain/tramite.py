@@ -1,9 +1,7 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from domain.documento import Documento
+from domain.documento import Documento
 
 
 class EstadoTramite(StrEnum):
@@ -21,5 +19,5 @@ class Tramite:
     monto: float
     estado: EstadoTramite = EstadoTramite.INICIADO
     id: int | None = None
-    usuario_id: int | None = None # dueño del tramite!
+    usuario_id: int | None = None  # dueño del tramite!
     documentos: list[Documento] = field(default_factory=list)

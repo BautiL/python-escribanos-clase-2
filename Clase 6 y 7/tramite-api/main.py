@@ -13,6 +13,7 @@ app.include_router(documento_router.router)
 app.include_router(auth_router.router)
 
 
+
 def _manejador(status_code: int, headers: dict[str, str] | None = None):
     async def manejar(request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=status_code, content={"detail": str(exc)}, headers=headers)
@@ -26,3 +27,7 @@ app.add_exception_handler(DocumentoNoEncontrado, _manejador(status.HTTP_404_NOT_
 app.add_exception_handler(TramiteFinalizado, _manejador(status.HTTP_409_CONFLICT))
 app.add_exception_handler(EmailYaRegistrado, _manejador(status.HTTP_409_CONFLICT))
 app.add_exception_handler(CredencialesInvalidas, _manejador(status.HTTP_401_UNAUTHORIZED, headers={"WWW-Authenticate": "Bearer"}))
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}

@@ -1,0 +1,1663 @@
+﻿=== config.py ===
+import os
+
+from dotenv import load_dotenv
+
+# No pisa variables que ya esten definidas en el entorno.
+load_dotenv()
+
+
+def variable_obligatoria(nombre: str) -> str:
+    """Devuelve la variable de entorno o corta el arranque si falta.
+
+    Mejor que la app no arranque a que arranque con un valor inseguro por defecto.
+    """
+    valor = os.getenv(nombre)
+    if not valor:
+        raise RuntimeError(f"Falta la variable de entorno {nombre} (ver .env.example)")
+    return valor
+=== dependencies.py ===
+from typing import Annotated
+
+from fastapi import Depends
+from fastapi.security import OAuth2PasswordBearer
+
+from repository.database import async_session_maker
+from repository.uow import AbstractUnitOfWork, SqlAlchemyUnitOfWork
+from service.documento_service import DocumentoService
+from service.tramite_service import TramiteService
+
+from domain.usuario import Usuario
+from service.auth_service import AuthService
+
+
+def get_uow() -> AbstractUnitOfWork:
+    return SqlAlchemyUnitOfWork(async_session_maker)
+
+
+UoWDep = Annotated[AbstractUnitOfWork, Depends(get_uow)]
+
+
+def get_service(uow: UoWDep) -> TramiteService:
+    return TramiteService(uow)
+
+
+def get_documento_service(uow: UoWDep) -> DocumentoService:
+    return DocumentoService(uow)
+
+def get_auth_service(uow: UoWDep) -> AuthService:
+    return AuthService(uow)
+
+
+ServiceDep = Annotated[TramiteService, Depends(get_service)]
+DocumentoServiceDep = Annotated[DocumentoService, Depends(get_documento_service)]
+AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+
+# Lee el header "Authorization: Bearer <token>". Si no estÃ¡, responde 401 solo.
+# tokenUrl es para Swagger: ahÃ­ manda el formulario del botÃ³n "Authorize".
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
+
+
+async def get_usuario_actual(
+    token: Annotated[str, Depends(oauth2_scheme)], service: AuthServiceDep
+) -> Usuario:
+    return await service.usuario_del_token(token)  # CredencialesInvalidas -> 401
+
+
+UsuarioActual = Annotated[Usuario, Depends(get_usuario_actual)]
+=== init_db.py ===
+# init_db.py
+import asyncio
+
+from repository.database import Base, engine
+# âš ï¸ IMPORTANTE: Importar los modelos
+import repository.models.tramiteModel
+import repository.models.documentoModel
+
+
+async def init_db():
+    async with engine.begin() as conn:
+        print("Creando tablas en PostgreSQL...")
+        await conn.run_sync(Base.metadata.create_all)
+        print("Â¡Tablas creadas con Ã©xito!")
+
+
+if __name__ == "__main__":
+    asyncio.run(init_db())
+=== main.py ===
+import os
+
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+
+from domain.errores import DocumentoNoEncontrado, TramiteFinalizado, TramiteNoEncontrado, CredencialesInvalidas, EmailYaRegistrado
+from routers import documento_router, tramite_router, auth_router
+
+# debug solo si se pide explicitamente: DEBUG=1
+app = FastAPI(title="Gestion de tramites", debug=os.getenv("DEBUG") == "1")
+app.include_router(tramite_router.router)
+app.include_router(documento_router.router)
+app.include_router(auth_router.router)
+
+
+def _manejador(status_code: int, headers: dict[str, str] | None = None):
+    async def manejar(request: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(status_code=status_code, content={"detail": str(exc)}, headers=headers)
+
+    return manejar
+
+
+# Errores del dominio -> codigos HTTP (sin esto la API respondia 500)
+app.add_exception_handler(TramiteNoEncontrado, _manejador(status.HTTP_404_NOT_FOUND))
+app.add_exception_handler(DocumentoNoEncontrado, _manejador(status.HTTP_404_NOT_FOUND))
+app.add_exception_handler(TramiteFinalizado, _manejador(status.HTTP_409_CONFLICT))
+app.add_exception_handler(EmailYaRegistrado, _manejador(status.HTTP_409_CONFLICT))
+app.add_exception_handler(CredencialesInvalidas, _manejador(status.HTTP_401_UNAUTHORIZED, headers={"WWW-Authenticate": "Bearer"}))
+
+=== README.md ===
+=== seguridad.py ===
+"""Hash de contraseÃ±as y tokens JWT. No sabe nada de FastAPI ni de la base."""
+
+from datetime import UTC, datetime, timedelta
+
+import jwt
+from pwdlib import PasswordHash
+
+from config import variable_obligatoria
+
+# Obligatoria: con una clave por defecto, cualquiera que lea el repo podria firmar tokens.
+SECRET_KEY = variable_obligatoria("SECRET_KEY")
+if len(SECRET_KEY.encode()) < 32:
+    raise RuntimeError("SECRET_KEY debe tener al menos 32 bytes (HS256)")
+
+ALGORITHM = "HS256"
+EXPIRACION = timedelta(minutes=30)
+
+_hasher = PasswordHash.recommended()  # Argon2
+
+
+def hashear_password(password: str) -> str:
+    return _hasher.hash(password)
+
+
+def verificar_password(password: str, password_hash: str) -> bool:
+    return _hasher.verify(password, password_hash)
+
+
+def crear_token(email: str, expiracion: timedelta = EXPIRACION) -> str:
+    ahora = datetime.now(UTC)
+    payload = {"sub": email, "iat": ahora, "exp": ahora + expiracion}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def leer_token(token: str) -> str | None:
+    """Devuelve el email del token, o None si es invÃ¡lido o estÃ¡ vencido."""
+    try:
+        # require: un token sin "exp" no vale (si no, serviria para siempre)
+        payload = jwt.decode(
+            token, SECRET_KEY, algorithms=[ALGORITHM], options={"require": ["exp", "sub"]}
+        )
+    except jwt.InvalidTokenError:  # firma invÃ¡lida, vencido, mal formado, sin exp/sub...
+        return None
+    return payload["sub"]
+=== .github\workflows\ci.yml ===
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run tests with coverage
+        run: uv run pytest --cov=. --cov-fail-under=70 -q
+
+=== .pytest_cache\README.md ===
+# pytest cache directory #
+
+This directory contains data from the pytest's cache plugin,
+which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+
+**Do not** commit this to version control.
+
+See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+
+=== domain\documento.py ===
+from dataclasses import dataclass
+
+
+@dataclass
+class Documento:
+    nombre: str
+    tipo: str
+    tramite_id: int | None = None
+    id: int | None = None
+    tamanio: int | None = None
+
+=== domain\errores.py ===
+class TramiteError(Exception):
+    """Base de todos los errores del dominio (sirva para atraparlos a todos juntos)"""
+
+class TramiteNoEncontrado(TramiteError):
+    def __init__(self, tramite_id: int) -> None:
+        super().__init__(f"No existe el tramite {tramite_id}")
+        self.tramite_id = tramite_id
+
+class TramiteFinalizado(TramiteError):
+    def __init__(self, tramite_id: int) -> None:
+        super().__init__(f"El tramite {tramite_id} esta finalizado y no se puede modificar")
+        self.tramite_id = tramite_id
+
+
+class DocumentoNoEncontrado(TramiteError):
+    def __init__(self, documento_id: int) -> None:
+        super().__init__(f"No existe el documento {documento_id}")
+        self.documento_id = documento_id
+
+class CredencialesInvalidas(Exception):
+    """Email o contraseÃ±a incorrectos, o token invÃ¡lido o vencido.
+
+    El mensaje es el mismo en todos los casos a propÃ³sito: no le decimos a un atacante
+    si el email existe.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("Credenciales invÃ¡lidas")
+
+class EmailYaRegistrado(Exception):
+    def __init__(self, email: str) -> None:
+        super().__init__(f"Ya existe un usuario con el email {email}")
+        self.email = email
+=== domain\tramite.py ===
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from domain.documento import Documento
+
+
+class EstadoTramite(StrEnum):
+    # estos son los estados del tramite
+    # estos estados son de tipo string
+    INICIADO = "iniciado"
+    EN_FIRMA = "en_firma"
+    FINALIZADO = "finalizado"
+
+
+@dataclass
+class Tramite:
+    tipo: str
+    cliente: str
+    monto: float
+    estado: EstadoTramite = EstadoTramite.INICIADO
+    id: int | None = None
+    usuario_id: int | None = None # dueÃ±o del tramite!
+    documentos: list[Documento] = field(default_factory=list)
+=== domain\usuario.py ===
+from dataclasses import dataclass
+
+
+@dataclass
+class Usuario:
+    email: str
+    nombre: str
+    password_hash: str  # nunca la contraseÃ±a: solo su hash
+    activo: bool = True
+    id: int | None = None
+=== migrations\env.py ===
+import asyncio
+from logging.config import fileConfig
+
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
+from alembic import context
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
+from repository.database import DATABASE_URL, Base
+
+import repository.models.documentoModel
+import repository.models.tramiteModel
+import repository.models.usuarioModel
+
+config.set_main_option("sqlalchemy.url", DATABASE_URL)
+target_metadata = Base.metadata
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# my_important_option = config.get_main_option("my_important_option")
+# ... etc.
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def do_run_migrations(connection: Connection) -> None:
+    context.configure(connection=connection, target_metadata=target_metadata)
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_async_migrations() -> None:
+    """In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
+
+    connectable = async_engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+
+    await connectable.dispose()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode."""
+
+    asyncio.run(run_async_migrations())
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+=== migrations\versions\158308b03a49_duenio_de_los_tramites.py ===
+"""duenio de los tramites
+
+Revision ID: 158308b03a49
+Revises: efa91cb3f4b1
+Create Date: 2026-11-24 16:25:14.605060
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '158308b03a49'
+down_revision: Union[str, Sequence[str], None] = 'efa91cb3f4b1'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.add_column('tramites', sa.Column('usuario_id', sa.Integer(), nullable=True))
+    op.create_index(op.f('ix_tramites_usuario_id'), 'tramites', ['usuario_id'], unique=False)
+    op.create_foreign_key('fk_tramites_usuario_id_usuarios', 'tramites', 'usuarios', ['usuario_id'], ['id'])
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    # WARNING: constraint name is None; this directive will fail as
+    # rendered.  Add a name, or use a naming convention; see
+    # https://alembic.sqlalchemy.org/en/latest/naming.html
+    op.drop_constraint('fk_tramites_usuario_id_usuarios', 'tramites', type_='foreignkey')
+    op.drop_index(op.f('ix_tramites_usuario_id'), table_name='tramites')
+    op.drop_column('tramites', 'usuario_id')
+    # ### end Alembic commands ###
+
+=== migrations\versions\b1a2d4e5f6c7_crear_tabla_documentos.py ===
+"""crear tabla documentos
+
+Revision ID: b1a2d4e5f6c7
+Revises: cf6ff646ccb1
+Create Date: 2026-11-05 00:00:00.000000
+
+"""
+from typing import Sequence, Union
+
+import sqlalchemy as sa
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = "b1a2d4e5f6c7"
+down_revision: Union[str, Sequence[str], None] = "cf6ff646ccb1"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "documentos",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("nombre", sa.String(), nullable=False),
+        sa.Column("tipo", sa.String(), nullable=False),
+        sa.Column("tamaÃ±o", sa.Integer(), nullable=True),
+        sa.Column("tramite_id", sa.Integer(), nullable=False),
+        sa.ForeignKeyConstraint(["tramite_id"], ["tramites.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+
+
+def downgrade() -> None:
+    op.drop_table("documentos")
+
+=== migrations\versions\cf6ff646ccb1_crear_tabla_tramites.py ===
+"""crear tabla tramites
+
+Revision ID: cf6ff646ccb1
+Revises: 
+Create Date: 2026-11-03 16:57:57.366280
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = 'cf6ff646ccb1'
+down_revision: Union[str, Sequence[str], None] = None
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table('tramites',
+    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+    sa.Column('tipo', sa.String(), nullable=False),
+    sa.Column('cliente', sa.String(), nullable=False),
+    sa.Column('monto', sa.Double(), nullable=False),
+    sa.Column(
+        "estado",
+            sa.Enum("iniciado", "en_firma", "finalizado", name="estado_tramite"),
+            nullable=False,
+    ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_table('tramites')
+    sa.Enum(name="estado_tramite").drop(op.get_bind(), checkfirst=True)
+    # ### end Alembic commands ###
+
+=== migrations\versions\d4e5f6a7b8c9_renombrar_columna_tamanio.py ===
+"""renombrar columna tamaÃ±o a tamanio
+
+La migracion anterior creo la columna como "tamaÃ±o", pero el modelo
+DocumentoModel la mapea como "tamanio".
+
+Revision ID: d4e5f6a7b8c9
+Revises: b1a2d4e5f6c7
+Create Date: 2026-11-17 00:00:00.000000
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = "d4e5f6a7b8c9"
+down_revision: Union[str, Sequence[str], None] = "b1a2d4e5f6c7"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.alter_column("documentos", "tamaÃ±o", new_column_name="tamanio")
+
+
+def downgrade() -> None:
+    op.alter_column("documentos", "tamanio", new_column_name="tamaÃ±o")
+
+=== migrations\versions\efa91cb3f4b1_crear_tabla_usuarios.py ===
+"""crear tabla usuarios
+
+Revision ID: efa91cb3f4b1
+Revises: d4e5f6a7b8c9
+Create Date: 2026-11-17 17:00:22.007772
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = 'efa91cb3f4b1'
+down_revision: Union[str, Sequence[str], None] = 'd4e5f6a7b8c9'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table('usuarios',
+    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+    sa.Column('email', sa.String(length=255), nullable=False),
+    sa.Column('nombre', sa.String(length=100), nullable=False),
+    sa.Column('password_hash', sa.String(length=255), nullable=False),
+    sa.Column('activo', sa.Boolean(), nullable=False),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_usuarios_email'), 'usuarios', ['email'], unique=True)
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_index(op.f('ix_usuarios_email'), table_name='usuarios')
+    op.drop_table('usuarios')
+    # ### end Alembic commands ###
+
+=== repository\database.py ===
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+from config import variable_obligatoria
+
+DATABASE_URL = variable_obligatoria("DATABASE_URL")
+
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+)
+async_session_maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+class Base(DeclarativeBase):
+    pass
+
+=== repository\documento_repository.py ===
+from typing import Protocol
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from domain.documento import Documento
+from domain.errores import DocumentoNoEncontrado
+from repository.mappers.documentoMapper import DocumentoMapper
+from repository.models.documentoModel import DocumentoModel
+
+
+class RepositorioDocumento(Protocol):
+    async def guardar(self, documento: Documento) -> Documento: ...
+    async def buscar(self, documento_id: int) -> Documento | None: ...
+    async def listar(self) -> list[Documento]: ...
+    async def eliminar(self, documento_id: int) -> None: ...
+    async def listar_por_tramite(self, tramite_id: int) -> list[Documento]: ...
+
+
+class RepositorioDocumentoSqlalchemy:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def guardar(self, documento: Documento) -> Documento:
+        if documento.id is None:
+            documento_model = DocumentoMapper.to_model(documento)
+            self.session.add(documento_model)
+            await self.session.flush()
+            documento.id = documento_model.id
+            documento.tramite_id = documento_model.tramite_id
+            return documento
+
+        documento_model = await self.session.get(DocumentoModel, documento.id)
+        if documento_model is None:
+            raise DocumentoNoEncontrado(documento.id)
+        documento_model.nombre = documento.nombre
+        documento_model.tipo = documento.tipo
+        documento_model.tamanio = documento.tamanio
+        await self.session.flush()
+        return documento
+
+    async def buscar(self, documento_id: int) -> Documento | None:
+        documento_model = await self.session.get(DocumentoModel, documento_id)
+        if documento_model is None:
+            return None
+        return DocumentoMapper.to_domain(documento_model)
+
+    async def listar(self) -> list[Documento]:
+        query = select(DocumentoModel).order_by(DocumentoModel.id)
+        result = await self.session.execute(query)
+        return [DocumentoMapper.to_domain(m) for m in result.scalars().all()]
+
+    async def listar_por_tramite(self, tramite_id: int) -> list[Documento]:
+        query = (
+            select(DocumentoModel)
+            .where(DocumentoModel.tramite_id == tramite_id)
+            .order_by(DocumentoModel.id)
+        )
+        result = await self.session.execute(query)
+        return [DocumentoMapper.to_domain(m) for m in result.scalars().all()]
+
+    async def eliminar(self, documento_id: int) -> None:
+        documento = await self.session.get(DocumentoModel, documento_id)
+        if documento is None:
+            raise DocumentoNoEncontrado(documento_id)
+        await self.session.delete(documento)
+        await self.session.flush()
+
+=== repository\tramite_repository.py ===
+from typing import Protocol
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from domain.errores import TramiteNoEncontrado
+from domain.tramite import EstadoTramite, Tramite
+from repository.mappers.tramiteMapper import TramiteMapper
+from repository.models.tramiteModel import TramiteModel
+
+
+class RepositorioTramite(Protocol):
+    # El "contrato" (la interface de "Java")
+    async def guardar(self, tramite: Tramite) -> Tramite: ...
+    async def buscar(self, tramite_id: int) -> Tramite | None: ...
+    async def listar(
+        self, usuario_id: int, estado: EstadoTramite | None = None, skip: int = 0, limit: int | None = None
+    ) -> list[Tramite]: ...
+    async def eliminar(self, tramite_id: int) -> None: ...
+
+
+class RepositorioTramiteSqlalchemy:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def guardar(self, tramite: Tramite) -> Tramite:
+        if tramite.id is None:
+            # Alta: INSERT del tramite (y de sus documentos, si trae)
+            tramite_model = TramiteMapper.to_model(tramite)
+            self.session.add(tramite_model)
+            await self.session.flush()
+            tramite.id = tramite_model.id
+            for documento, documento_model in zip(tramite.documentos, tramite_model.documentos):
+                documento.id = documento_model.id
+                documento.tramite_id = tramite_model.id
+            return tramite
+
+        # Modificacion: se actualiza el modelo ya persistido (no se crea uno nuevo
+        # con el mismo id, eso provocaba un INSERT duplicado).
+        tramite_model = await self.session.get(TramiteModel, tramite.id)
+        if tramite_model is None:
+            raise TramiteNoEncontrado(tramite.id)
+        tramite_model.tipo = tramite.tipo
+        tramite_model.cliente = tramite.cliente
+        tramite_model.monto = tramite.monto
+        tramite_model.estado = tramite.estado
+        await self.session.flush()
+        return tramite
+
+    async def eliminar(self, tramite_id: int) -> None:
+        tramite = await self.session.get(TramiteModel, tramite_id)
+        if tramite is None:
+            raise TramiteNoEncontrado(tramite_id)
+        await self.session.delete(tramite)
+        await self.session.flush()
+
+    async def buscar(self, tramite_id: int) -> Tramite | None:
+        tramite_model = await self.session.get(TramiteModel, tramite_id)
+        if tramite_model is None:
+            return None
+        return TramiteMapper.to_domain(tramite_model)
+
+    async def listar(
+        self, usuario_id: int, estado: EstadoTramite | None = None, skip: int = 0, limit: int | None = None
+    ) -> list[Tramite]:
+        # El filtro y la paginacion se hacen en la base, no en memoria
+        query = select(TramiteModel).where(TramiteModel.usuario_id == usuario_id).order_by(TramiteModel.id)
+        if estado is not None:
+            query = query.where(TramiteModel.estado == estado)
+        query = query.offset(skip)
+        if limit is not None:
+            query = query.limit(limit)
+        result = await self.session.execute(query)
+        return [TramiteMapper.to_domain(tramite_model) for tramite_model in result.scalars().all()]
+
+=== repository\uow.py ===
+from types import TracebackType
+from typing import Protocol, Self
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from repository.documento_repository import RepositorioDocumento, RepositorioDocumentoSqlalchemy
+from repository.tramite_repository import RepositorioTramite, RepositorioTramiteSqlalchemy
+from repository.usuario_repository import RepositorioUsuario, RepositorioUsuarioSqlalchemy
+
+
+class AbstractUnitOfWork(Protocol):
+    tramites: RepositorioTramite
+    documentos: RepositorioDocumento
+    usuarios: RepositorioUsuario
+
+    async def __aenter__(self) -> Self: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None: ...
+    async def commit(self) -> None: ...
+    async def rollback(self) -> None: ...
+
+
+class SqlAlchemyUnitOfWork:
+    tramites: RepositorioTramite
+    documentos: RepositorioDocumento
+    usuarios: RepositorioUsuario
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self.session_factory = session_factory
+        self.session: AsyncSession | None = None
+
+    async def __aenter__(self) -> Self:
+        # La misma instancia se comparte en un request (FastAPI cachea get_uow).
+        # Usarla anidada pisaria la sesion abierta: mejor fallar fuerte.
+        if self.session is not None:
+            raise RuntimeError("El Unit of Work ya esta en uso (no se puede anidar)")
+        self.session = self.session_factory()
+        self.tramites = RepositorioTramiteSqlalchemy(self.session)
+        self.documentos = RepositorioDocumentoSqlalchemy(self.session)
+        self.usuarios = RepositorioUsuarioSqlalchemy(self.session)
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        try:
+            if exc_type:
+                await self.rollback()
+            else:
+                await self.commit()
+        finally:
+            # Se cierra la sesion aunque el commit falle
+            await self._sesion_activa().close()
+            self.session = None
+
+    async def commit(self) -> None:
+        await self._sesion_activa().commit()
+
+    async def rollback(self) -> None:
+        await self._sesion_activa().rollback()
+
+    def _sesion_activa(self) -> AsyncSession:
+        if self.session is None:
+            raise RuntimeError("El Unit of Work no esta abierto (usar 'async with')")
+        return self.session
+
+=== repository\usuario_repository.py ===
+from typing import Protocol
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from domain.usuario import Usuario
+from repository.mappers.usuarioMapper import UsuarioMapper
+from repository.models.usuarioModel import UsuarioModel
+
+
+class RepositorioUsuario(Protocol):
+    async def guardar(self, usuario: Usuario) -> Usuario: ...
+    async def buscar_por_email(self, email: str) -> Usuario | None: ...
+
+
+class RepositorioUsuarioSqlalchemy:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def guardar(self, usuario: Usuario) -> Usuario:
+        model = UsuarioMapper.to_model(usuario)
+        self.session.add(model)
+        await self.session.flush()
+        usuario.id = model.id
+        return usuario
+
+    async def buscar_por_email(self, email: str) -> Usuario | None:
+        query = select(UsuarioModel).where(UsuarioModel.email == email)
+        model = (await self.session.execute(query)).scalar_one_or_none()
+        return UsuarioMapper.to_domain(model) if model else None
+=== repository\mappers\documentoMapper.py ===
+from domain.documento import Documento
+from repository.models.documentoModel import DocumentoModel
+
+
+class DocumentoMapper:
+    @staticmethod
+    def to_model(documento: Documento) -> DocumentoModel:
+        return DocumentoModel(
+            id=documento.id,
+            nombre=documento.nombre,
+            tipo=documento.tipo,
+            tamanio=documento.tamanio,
+            tramite_id=documento.tramite_id,
+        )
+
+    @staticmethod
+    def to_domain(documento_model: DocumentoModel) -> Documento:
+        return Documento(
+            id=documento_model.id,
+            nombre=documento_model.nombre,
+            tipo=documento_model.tipo,
+            tamanio=documento_model.tamanio,
+            tramite_id=documento_model.tramite_id,
+        )
+
+=== repository\mappers\tramiteMapper.py ===
+from domain.tramite import Tramite
+from repository.models.tramiteModel import TramiteModel
+from repository.mappers.documentoMapper import DocumentoMapper
+
+class TramiteMapper:
+    @staticmethod
+    def to_model(tramite: Tramite) -> TramiteModel:
+        return TramiteModel(
+            id=tramite.id,
+            tipo= tramite.tipo,
+            cliente= tramite.cliente,
+            monto = tramite.monto,
+            estado=tramite.estado,
+            usuario_id = tramite.usuario_id, 
+            documentos = [DocumentoMapper.to_model(documento) for documento in tramite.documentos]
+        )
+
+    @staticmethod
+    def to_domain(tramite_model: TramiteModel) -> Tramite:
+        return Tramite(
+            id=tramite_model.id,
+            tipo= tramite_model.tipo,
+            cliente= tramite_model.cliente,
+            monto = tramite_model.monto,
+            estado=tramite_model.estado,
+            usuario_id = tramite_model.usuario_id,
+            documentos = [
+                DocumentoMapper.to_domain(documento_model) for documento_model in tramite_model.documentos
+            ]
+        )
+=== repository\mappers\usuarioMapper.py ===
+from domain.usuario import Usuario
+from repository.models.usuarioModel import UsuarioModel
+
+
+class UsuarioMapper:
+    @staticmethod
+    def to_model(usuario: Usuario) -> UsuarioModel:
+        return UsuarioModel(
+            id=usuario.id,
+            email=usuario.email,
+            nombre=usuario.nombre,
+            password_hash=usuario.password_hash,
+            activo=usuario.activo,
+        )
+
+    @staticmethod
+    def to_domain(model: UsuarioModel) -> Usuario:
+        return Usuario(
+            id=model.id,
+            email=model.email,
+            nombre=model.nombre,
+            password_hash=model.password_hash,
+            activo=model.activo,
+        )
+=== repository\models\documentoModel.py ===
+from typing import TYPE_CHECKING
+
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from repository.database import Base
+
+if TYPE_CHECKING:
+    from repository.models.tramiteModel import TramiteModel
+
+
+class DocumentoModel(Base):
+    __tablename__ = "documentos"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    nombre: Mapped[str]
+    tipo: Mapped[str]
+    tamanio: Mapped[int | None] = mapped_column(nullable=True)
+    tramite_id: Mapped[int] = mapped_column(
+        ForeignKey("tramites.id", ondelete="CASCADE"), nullable=False
+    )
+
+    tramite: Mapped["TramiteModel"] = relationship(back_populates="documentos")
+
+=== repository\models\tramiteModel.py ===
+from typing import TYPE_CHECKING
+
+from sqlalchemy import Enum as SQLEnum
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from domain.tramite import EstadoTramite
+from repository.database import Base
+
+if TYPE_CHECKING:
+    from repository.models.documentoModel import DocumentoModel
+
+
+class TramiteModel(Base):
+    __tablename__ = "tramites"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tipo: Mapped[str]
+    cliente: Mapped[str]
+    monto: Mapped[float]
+    # values_callable: guarda el VALOR del enum ("iniciado") y no el NOMBRE ("INICIADO"),
+    # que es lo que espera el tipo estado_tramite creado por la migracion.
+    estado: Mapped[EstadoTramite] = mapped_column(
+        SQLEnum(
+            EstadoTramite,
+            name="estado_tramite",
+            create_type=True,
+            values_callable=lambda enum: [miembro.value for miembro in enum],
+        ),
+        default=EstadoTramite.INICIADO,
+        nullable=False,
+    )
+    usuario_id: Mapped[int | None] = mapped_column(
+        ForeignKey("usuarios.id"), nullable=True, index=True
+    )
+    # cascade: al borrar un tramite se borran sus documentos
+    # (sin esto SQLAlchemy intenta poner tramite_id = NULL y falla por el NOT NULL).
+    documentos: Mapped[list["DocumentoModel"]] = relationship(
+        back_populates="tramite",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+=== repository\models\usuarioModel.py ===
+from sqlalchemy import String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from repository.database import Base
+
+
+class UsuarioModel(Base):
+    __tablename__ = "usuarios"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    nombre: Mapped[str] = mapped_column(String(100))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    activo: Mapped[bool] = mapped_column(default=True)
+=== routers\auth_router.py ===
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, status
+from fastapi.security import OAuth2PasswordRequestForm
+
+from dependencies import AuthServiceDep, UsuarioActual
+from schemas.usuario import Token, UsuarioCrear, UsuarioRespuesta
+
+router = APIRouter(prefix="/auth", tags=["Auth"])
+
+
+@router.post("/registro", status_code=status.HTTP_201_CREATED)
+async def registrar(datos: UsuarioCrear, service: AuthServiceDep) -> UsuarioRespuesta:
+    return UsuarioRespuesta.model_validate(await service.registrar(datos))
+
+
+@router.post("/token")
+async def login(
+    form: Annotated[OAuth2PasswordRequestForm, Depends()], service: AuthServiceDep
+) -> Token:
+    # OAuth2 manda un formulario (no JSON) con "username" y "password".
+    # Nuestro username es el email.
+    return Token(access_token=await service.login(form.username, form.password))
+
+
+@router.get("/yo")
+async def yo(usuario: UsuarioActual) -> UsuarioRespuesta:
+    return UsuarioRespuesta.model_validate(usuario)
+=== routers\documento_router.py ===
+from fastapi import APIRouter, status
+
+from dependencies import DocumentoServiceDep
+from schemas.documento import DocumentoCrear, DocumentoRespuesta
+
+router = APIRouter(prefix="/tramites/{tramite_id}/documentos", tags=["Documentos"])
+
+
+@router.get("/")
+async def listar_documentos(
+    tramite_id: int, service: DocumentoServiceDep
+) -> list[DocumentoRespuesta]:
+    return [
+        DocumentoRespuesta.model_validate(d) for d in await service.listar_por_tramite(tramite_id)
+    ]
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+async def crear_documento(
+    tramite_id: int, datos: DocumentoCrear, service: DocumentoServiceDep
+) -> DocumentoRespuesta:
+    documento = await service.crear(tramite_id, datos)
+    return DocumentoRespuesta.model_validate(documento)
+
+
+@router.get("/{documento_id}")
+async def obtener_documento(
+    tramite_id: int, documento_id: int, service: DocumentoServiceDep
+) -> DocumentoRespuesta:
+    return DocumentoRespuesta.model_validate(await service.obtener(tramite_id, documento_id))
+
+
+@router.delete("/{documento_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def eliminar_documento(
+    tramite_id: int, documento_id: int, service: DocumentoServiceDep
+) -> None:
+    await service.eliminar(tramite_id, documento_id)
+
+=== routers\tramite_router.py ===
+from typing import Annotated
+
+from fastapi import APIRouter, Query, status
+
+from dependencies import ServiceDep, UsuarioActual
+from domain.tramite import EstadoTramite
+from schemas.tramite import TramiteActualizar, TramiteCrear, TramiteRespuesta
+
+router = APIRouter(prefix="/tramites", tags=["Tramites"])
+
+
+@router.get("/")
+async def listar(
+    service: ServiceDep,
+    usuario: UsuarioActual, 
+    estado: EstadoTramite | None = None,
+    skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 10,
+) -> list[TramiteRespuesta]:
+    tramites = await service.listar(usuario.id, estado, skip, limit)
+    return [TramiteRespuesta.model_validate(t) for t in tramites]
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+async def crear(datos: TramiteCrear, service: ServiceDep, usuario: UsuarioActual) -> TramiteRespuesta:
+    tramite = await service.crear(datos, usuario.id)
+    return TramiteRespuesta.model_validate(tramite)
+
+
+@router.get("/{tramite_id}")
+async def obtener(tramite_id: int, service: ServiceDep, usuario: UsuarioActual) -> TramiteRespuesta:
+    return TramiteRespuesta.model_validate(await service.obtener(tramite_id, usuario.id))
+
+
+@router.put("/{tramite_id}")
+async def reemplazar(tramite_id: int, datos: TramiteCrear, service: ServiceDep, usuario: UsuarioActual) -> TramiteRespuesta:
+    return TramiteRespuesta.model_validate(await service.reemplazar(tramite_id, datos, usuario.id))
+
+
+@router.patch("/{tramite_id}")
+async def actualizar(
+    tramite_id: int, datos: TramiteActualizar, service: ServiceDep, usuario: UsuarioActual
+) -> TramiteRespuesta:
+    return TramiteRespuesta.model_validate(await service.actualizar(tramite_id, datos, usuario.id))
+
+
+@router.delete("/{tramite_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def eliminar(tramite_id: int, service: ServiceDep, usuario: UsuarioActual) -> None:
+    await service.eliminar(tramite_id, usuario.id)
+
+=== schemas\documento.py ===
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field
+
+class DocumentoCrear(BaseModel):
+    nombre: Annotated[str, Field(min_length=5, max_length=50)]
+    tipo: Annotated[str, Field(min_length=5, max_length=50)]
+    tamanio: Annotated[int|None, Field(ge=0)] = None
+
+class DocumentoRespuesta(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    nombre: str
+    tipo: str
+    tamanio: int | None = None
+    tramite_id: int | None = None
+=== schemas\tramite.py ===
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field 
+
+from domain.tramite import EstadoTramite
+
+class TramiteCrear(BaseModel): 
+    """Lo que manda el cliente para crear (POST) o reemplazar (PUT) un tramite."""
+    # Annotated[tipo, reglas]
+    tipo: Annotated[str, Field(min_length=3, max_length=50, examples=["compraventa"])]
+    cliente: Annotated[str, Field(min_length=3, examples=["Ana Gomez"])]
+    monto: Annotated[float, Field(gt=0, examples=[150000])] # gt = greater than (> 0)
+
+class TramiteActualizar(BaseModel): 
+    """Patch: el cliente manda solo lo que quiere cambiar, asi que todo es opcional!!!"""
+    tipo: Annotated[str | None, Field(min_length=3, max_length=50, examples=["compraventa"])] = None
+    cliente: Annotated[str | None, Field(min_length=3, examples=["Ana Gomez"])] = None
+    monto: Annotated[float | None, Field(gt=0, examples=[150000])] = None
+
+class TramiteRespuesta(BaseModel):
+    """Lo que devuelve la API."""
+    # "podes armarme a partir de cualquier objeto que tengas estos atributos (por ejemplo, del dataclass Tramite del dominio)"
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    tipo: str
+    cliente: str
+    monto: float
+    estado: EstadoTramite
+=== schemas\usuario.py ===
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+
+class UsuarioCrear(BaseModel):
+    email: EmailStr
+    nombre: Annotated[str, Field(min_length=3, max_length=100, examples=["Ana Gomez"])]
+    password: Annotated[str, Field(min_length=8, max_length=128)]
+
+
+class UsuarioRespuesta(BaseModel):
+    """Sin password_hash: lo que no estÃ¡ en el schema no sale en la respuesta."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: str
+    nombre: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+=== service\auth_service.py ===
+from domain.errores import CredencialesInvalidas, EmailYaRegistrado
+from domain.usuario import Usuario
+from repository.uow import AbstractUnitOfWork
+from schemas.usuario import UsuarioCrear
+from seguridad import crear_token, hashear_password, leer_token, verificar_password
+
+
+class AuthService:
+    def __init__(self, uow: AbstractUnitOfWork) -> None:
+        self._uow = uow
+
+    async def registrar(self, datos: UsuarioCrear) -> Usuario:
+        async with self._uow:
+            if await self._uow.usuarios.buscar_por_email(datos.email) is not None:
+                raise EmailYaRegistrado(datos.email)
+            usuario = Usuario(
+                email=datos.email,
+                nombre=datos.nombre,
+                password_hash=hashear_password(datos.password),
+            )
+            return await self._uow.usuarios.guardar(usuario)
+
+    async def login(self, email: str, password: str) -> str:
+        async with self._uow:
+            usuario = await self._uow.usuarios.buscar_por_email(email)
+        # Mismo error si el email no existe o la contraseÃ±a no coincide
+        if usuario is None or not verificar_password(password, usuario.password_hash):
+            raise CredencialesInvalidas()
+        if not usuario.activo:
+            raise CredencialesInvalidas()
+        return crear_token(usuario.email)
+
+    async def usuario_del_token(self, token: str) -> Usuario:
+        email = leer_token(token)
+        if email is None:
+            raise CredencialesInvalidas()
+        async with self._uow:
+            usuario = await self._uow.usuarios.buscar_por_email(email)
+        if usuario is None or not usuario.activo:
+            raise CredencialesInvalidas()
+        return usuario
+=== service\documento_service.py ===
+from domain.documento import Documento
+from domain.errores import DocumentoNoEncontrado, TramiteFinalizado, TramiteNoEncontrado
+from domain.tramite import EstadoTramite, Tramite
+from repository.uow import AbstractUnitOfWork
+from schemas.documento import DocumentoCrear
+
+
+class DocumentoService:
+    def __init__(self, uow: AbstractUnitOfWork) -> None:
+        self._uow = uow
+
+    async def crear(self, tramite_id: int, datos: DocumentoCrear) -> Documento:
+        async with self._uow:
+            await self._tramite_modificable(tramite_id)
+            documento = Documento(
+                nombre=datos.nombre,
+                tipo=datos.tipo,
+                tamanio=datos.tamanio,
+                tramite_id=tramite_id,
+            )
+            return await self._uow.documentos.guardar(documento)
+
+    async def listar_por_tramite(self, tramite_id: int) -> list[Documento]:
+        async with self._uow:
+            await self._tramite_existente(tramite_id)
+            return await self._uow.documentos.listar_por_tramite(tramite_id)
+
+    async def obtener(self, tramite_id: int, documento_id: int) -> Documento:
+        async with self._uow:
+            await self._tramite_existente(tramite_id)
+            return await self._documento_del_tramite(tramite_id, documento_id)
+
+    async def eliminar(self, tramite_id: int, documento_id: int) -> None:
+        async with self._uow:
+            await self._tramite_modificable(tramite_id)
+            await self._documento_del_tramite(tramite_id, documento_id)
+            await self._uow.documentos.eliminar(documento_id)
+
+    # metodos privados
+    async def _tramite_existente(self, tramite_id: int) -> Tramite:
+        tramite = await self._uow.tramites.buscar(tramite_id)
+        if tramite is None:
+            raise TramiteNoEncontrado(tramite_id)
+        return tramite
+
+    async def _tramite_modificable(self, tramite_id: int) -> Tramite:
+        tramite = await self._tramite_existente(tramite_id)
+        if tramite.estado is EstadoTramite.FINALIZADO:
+            raise TramiteFinalizado(tramite_id)
+        return tramite
+
+    async def _documento_del_tramite(self, tramite_id: int, documento_id: int) -> Documento:
+        documento = await self._uow.documentos.buscar(documento_id)
+        # Un documento de OTRO tramite se trata como inexistente
+        if documento is None or documento.tramite_id != tramite_id:
+            raise DocumentoNoEncontrado(documento_id)
+        return documento
+
+=== service\tramite_service.py ===
+from domain.errores import TramiteFinalizado, TramiteNoEncontrado
+from domain.tramite import EstadoTramite, Tramite
+from repository.uow import AbstractUnitOfWork
+from schemas.tramite import TramiteActualizar, TramiteCrear
+
+
+class TramiteService:
+    def __init__(self, uow: AbstractUnitOfWork) -> None:
+        # Inyeccion por constructor => el servicio no sabe QUE repositorio le dieron
+        # solamente sabe que cumple con el Protocol.
+        self._uow = uow
+
+    async def crear(self, datos: TramiteCrear, usuario_id: int) -> Tramite:
+        async with self._uow:
+            tramite = Tramite(**datos.model_dump(), usuario_id = usuario_id)
+            return await self._uow.tramites.guardar(tramite)
+
+    async def listar(self, usuario_id: int, estado: EstadoTramite | None, skip: int, limit: int) -> list[Tramite]:
+        async with self._uow:
+            return await self._uow.tramites.listar(usuario_id, estado, skip, limit)
+
+    async def obtener(self, tramite_id: int, usuario_id: int) -> Tramite:
+        async with self._uow:
+            return await self._obtener_interno(tramite_id, usuario_id)
+
+    async def reemplazar(self, tramite_id: int, datos: TramiteCrear, usuario_id: int) -> Tramite:
+        async with self._uow:
+            tramite = await self._modificable_interno(tramite_id, usuario_id)
+            tramite.tipo = datos.tipo
+            tramite.cliente = datos.cliente
+            tramite.monto = datos.monto
+            return await self._uow.tramites.guardar(tramite)
+
+    async def actualizar(self, tramite_id: int, datos: TramiteActualizar, usuario_id: int) -> Tramite:
+        async with self._uow:
+            tramite = await self._modificable_interno(tramite_id, usuario_id)
+            # Solo los campos que el cliente mando (y que no vienen en null)
+            cambios = datos.model_dump(exclude_unset=True, exclude_none=True)
+            for campo, valor in cambios.items():
+                setattr(tramite, campo, valor)
+            return await self._uow.tramites.guardar(tramite)
+
+    async def eliminar(self, tramite_id: int, usuario_id: int) -> None:
+        async with self._uow:
+            await self._modificable_interno(tramite_id, usuario_id)
+            await self._uow.tramites.eliminar(tramite_id)
+
+    # metodos privados
+    async def _obtener_interno(self, tramite_id: int, usuario_id: int) -> Tramite:
+        tramite = await self._uow.tramites.buscar(tramite_id)
+        if tramite is None or tramite.usuario_id != usuario_id:
+            raise TramiteNoEncontrado(tramite_id)
+        return tramite
+
+    async def _modificable_interno(self, tramite_id: int, usuario_id: int) -> Tramite:
+        tramite = await self._obtener_interno(tramite_id, usuario_id)
+        if tramite.estado is EstadoTramite.FINALIZADO:
+            raise TramiteFinalizado(tramite_id)
+        return tramite
+
+=== src\tramite_api\__init__.py ===
+def main() -> None:
+    print("Hello from tramite-api!")
+
+=== tests\test_tests.py ===
+import asyncio
+import os
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from dependencies import get_uow
+from domain.documento import Documento
+from domain.errores import DocumentoNoEncontrado, TramiteFinalizado, TramiteNoEncontrado
+from domain.tramite import EstadoTramite, Tramite
+from main import app
+from repository.database import Base
+from repository.documento_repository import RepositorioDocumentoSqlalchemy
+from repository.tramite_repository import RepositorioTramiteSqlalchemy
+from schemas.documento import DocumentoCrear
+from schemas.tramite import TramiteActualizar, TramiteCrear
+from service.documento_service import DocumentoService
+from service.tramite_service import TramiteService
+
+# Base SEPARADA para tests: el test de integracion hace drop_all y no debe tocar tramites_db
+TEST_DATABASE_URL = os.getenv(
+    "TEST_DATABASE_URL",
+    "postgresql+asyncpg://postgres:admin@localhost:5432/tramites_db_test",
+)
+
+
+class FakeRepositorio:
+    def __init__(self, items=None):
+        self.items = items or {}
+
+    async def guardar(self, entidad):
+        if entidad.id is None:
+            entidad.id = max(self.items.keys(), default=0) + 1
+        self.items[entidad.id] = entidad
+        return entidad
+
+    async def buscar(self, entidad_id):
+        return self.items.get(entidad_id)
+
+    async def listar(self, estado=None, skip=0, limit=None):
+        items = list(self.items.values())
+        if estado is not None:
+            items = [i for i in items if i.estado == estado]
+        fin = None if limit is None else skip + limit
+        return items[skip:fin]
+
+    async def listar_por_tramite(self, tramite_id):
+        return [doc for doc in self.items.values() if getattr(doc, "tramite_id", None) == tramite_id]
+
+    async def eliminar(self, entidad_id):
+        self.items.pop(entidad_id, None)
+
+
+class FakeUnitOfWork:
+    def __init__(self, tramites=None, documentos=None):
+        self.tramites = tramites or FakeRepositorio()
+        self.documentos = documentos or FakeRepositorio()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def commit(self):
+        return None
+
+    async def rollback(self):
+        return None
+
+
+@pytest.fixture
+def uow():
+    return FakeUnitOfWork()
+
+
+@pytest.fixture
+def client(uow):
+    app.dependency_overrides[get_uow] = lambda: uow
+    try:
+        with TestClient(app) as c:
+            yield c
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _tramite(estado=EstadoTramite.INICIADO, **kwargs):
+    datos = {"tipo": "compraventa", "cliente": "Ana Gomez", "monto": 1000.0} | kwargs
+    return Tramite(estado=estado, **datos)
+
+
+# ---------------------------------------------------------------- dominio / schemas
+
+def test_tramite_se_crea_con_estado_iniciado():
+    tramite = Tramite(tipo="compraventa", cliente="Ana Gomez", monto=150000)
+
+    assert tramite.estado == EstadoTramite.INICIADO
+    assert tramite.documentos == []
+
+
+def test_validacion_de_monto_de_tramite():
+    with pytest.raises(ValueError):
+        TramiteCrear.model_validate({"tipo": "compraventa", "cliente": "juan perez", "monto": 0})
+
+
+# ---------------------------------------------------------------- servicios
+
+def test_tramite_service_guarda_el_tramite(uow):
+    async def _ejecutar():
+        service = TramiteService(uow)
+        tramite = await service.crear(
+            TramiteCrear(tipo="compraventa", cliente="pablo gomez", monto=200000)
+        )
+        assert await uow.tramites.buscar(1) == tramite
+
+    asyncio.run(_ejecutar())
+
+
+def test_tramite_service_guarda_tramite_mock(uow):
+    async def _ejecutar():
+        service = TramiteService(uow)
+
+        uow.__aenter__ = AsyncMock(return_value=uow)
+        uow.__aexit__ = AsyncMock(return_value=None)
+        uow.tramites.guardar = AsyncMock(side_effect=lambda tramite: tramite)
+
+        tramite = await service.crear(TramiteCrear(tipo="compraventa", cliente="pablo perez", monto=50000))
+
+        uow.tramites.guardar.assert_awaited_once()
+        assert tramite.tipo == "compraventa"
+        assert tramite.cliente == "pablo perez"
+        assert tramite.monto == 50000
+
+    asyncio.run(_ejecutar())
+
+
+def test_tramite_service_no_modifica_finalizado(uow):
+    async def _ejecutar():
+        await uow.tramites.guardar(_tramite(EstadoTramite.FINALIZADO))
+        service = TramiteService(uow)
+        with pytest.raises(TramiteFinalizado):
+            await service.actualizar(1, TramiteActualizar(monto=5))
+        with pytest.raises(TramiteFinalizado):
+            await service.eliminar(1)
+
+    asyncio.run(_ejecutar())
+
+
+def test_tramite_service_obtener_inexistente(uow):
+    with pytest.raises(TramiteNoEncontrado):
+        asyncio.run(TramiteService(uow).obtener(99))
+
+
+def test_documento_service_rechaza_documento_de_otro_tramite(uow):
+    async def _ejecutar():
+        await uow.tramites.guardar(_tramite())
+        await uow.tramites.guardar(_tramite())
+        await uow.documentos.guardar(Documento(nombre="dni.pdf", tipo="identidad", tramite_id=1))
+        service = DocumentoService(uow)
+        with pytest.raises(DocumentoNoEncontrado):
+            await service.obtener(2, 1)
+
+    asyncio.run(_ejecutar())
+
+
+# ---------------------------------------------------------------- HTTP
+
+def test_integracion_http(client):
+    response = client.post(
+        "/tramites/", json={"tipo": "compraventa", "cliente": "sofia lopez", "monto": 32000}
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["tipo"] == "compraventa"
+    assert payload["cliente"] == "sofia lopez"
+    assert payload["monto"] == 32000
+    assert payload["estado"] == "iniciado"
+
+
+def test_http_crud_tramite(client):
+    client.post("/tramites/", json={"tipo": "compraventa", "cliente": "Ana Gomez", "monto": 100})
+
+    assert client.get("/tramites/1").json()["cliente"] == "Ana Gomez"
+
+    r = client.put("/tramites/1", json={"tipo": "alquiler", "cliente": "Ana Gomez", "monto": 200})
+    assert r.status_code == 200 and r.json()["tipo"] == "alquiler"
+
+    r = client.patch("/tramites/1", json={"monto": 300})
+    assert r.status_code == 200
+    assert r.json()["monto"] == 300 and r.json()["tipo"] == "alquiler"
+
+    assert client.delete("/tramites/1").status_code == 204
+    assert client.get("/tramites/1").status_code == 404
+
+
+def test_http_listar_filtra_y_pagina(client, uow):
+    async def _cargar():
+        await uow.tramites.guardar(_tramite())
+        await uow.tramites.guardar(_tramite(EstadoTramite.FINALIZADO))
+        await uow.tramites.guardar(_tramite())
+
+    asyncio.run(_cargar())
+
+    assert len(client.get("/tramites/").json()) == 3
+    assert [t["id"] for t in client.get("/tramites/?estado=iniciado").json()] == [1, 3]
+    assert [t["id"] for t in client.get("/tramites/?skip=1&limit=1").json()] == [2]
+
+
+def test_http_errores_de_dominio(client, uow):
+    asyncio.run(uow.tramites.guardar(_tramite(EstadoTramite.FINALIZADO)))
+    documento = {"nombre": "dni.pdf", "tipo": "identidad"}
+
+    assert client.post("/tramites/99/documentos/", json=documento).status_code == 404
+    assert client.get("/tramites/99/documentos/").status_code == 404
+    assert client.post("/tramites/1/documentos/", json=documento).status_code == 409
+    assert client.patch("/tramites/1", json={"monto": 10}).status_code == 409
+
+
+def test_http_documentos(client):
+    client.post("/tramites/", json={"tipo": "compraventa", "cliente": "Ana Gomez", "monto": 100})
+
+    r = client.post("/tramites/1/documentos/", json={"nombre": "dni.pdf", "tipo": "identidad", "tamanio": 10})
+    assert r.status_code == 201
+    assert r.json() == {"id": 1, "nombre": "dni.pdf", "tipo": "identidad", "tamanio": 10, "tramite_id": 1}
+
+    assert len(client.get("/tramites/1/documentos/").json()) == 1
+    assert client.get("/tramites/1/documentos/1").status_code == 200
+    assert client.delete("/tramites/1/documentos/1").status_code == 204
+    assert client.get("/tramites/1/documentos/1").status_code == 404
+
+
+# ---------------------------------------------------------------- base de datos real
+
+def test_integracion_bd():
+    async def _ejecutar():
+        engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SELECT 1"))
+        except Exception:
+            await engine.dispose()
+            pytest.skip("La base de tests no estÃ¡ disponible (TEST_DATABASE_URL)")
+
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+                await conn.run_sync(Base.metadata.create_all)
+
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            async with session_factory() as session:
+                repo = RepositorioTramiteSqlalchemy(session)
+                docs = RepositorioDocumentoSqlalchemy(session)
+
+                guardado = await repo.guardar(_tramite(tipo="alquiler", cliente="Pedro Ruiz", monto=300000))
+                assert guardado.id is not None
+
+                encontrado = await repo.buscar(guardado.id)
+                assert encontrado is not None
+                assert encontrado.tipo == "alquiler"
+                assert encontrado.estado == EstadoTramite.INICIADO
+
+                # el enum se guarda por valor ("iniciado"), igual que en la migracion
+                valor = await session.scalar(text("SELECT estado::text FROM tramites"))
+                assert valor == "iniciado"
+
+                # actualizar un tramite existente (antes hacia un INSERT duplicado)
+                encontrado.monto = 1
+                await repo.guardar(encontrado)
+                assert (await repo.buscar(guardado.id)).monto == 1
+
+                # borrar un tramite con documentos (antes fallaba por el NOT NULL)
+                await docs.guardar(Documento(nombre="dni.pdf", tipo="identidad", tramite_id=guardado.id))
+                session.expunge_all()
+                await repo.eliminar(guardado.id)
+                assert await docs.listar() == []
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_ejecutar())
+
